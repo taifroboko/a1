@@ -3,6 +3,7 @@ import time
 from typing import Any, Callable, Dict, Tuple
 import aiohttp
 import functools
+import contextlib
 
 class RequestManager:
     """Asynchronous request manager with rate limiting and batching.
@@ -16,13 +17,14 @@ class RequestManager:
 
     def __init__(self, api_key: str,
                  max_requests_per_second: int = 5,
-                 max_batch_size: int = 5):
+                 max_batch_size: int = 5,
+                 queue_maxsize: int = 0):
         self.api_key = api_key or "default"
         self.max_requests_per_second = max_requests_per_second
         self.max_batch_size = max_batch_size
         if self.api_key not in RequestManager._workers:
             RequestManager._workers[self.api_key] = _RequestWorker(
-                max_requests_per_second, max_batch_size
+                max_requests_per_second, max_batch_size, maxsize=queue_maxsize
             )
         self.worker = RequestManager._workers[self.api_key]
 
@@ -30,7 +32,8 @@ class RequestManager:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        # Workers are long-lived for the lifetime of the application
+        await self.worker.shutdown()
+        RequestManager._workers.pop(self.api_key, None)
         return None
 
     async def get(self, url: str, **kwargs) -> Any:
@@ -47,10 +50,11 @@ class RequestManager:
 class _RequestWorker:
     """Background worker processing requests for a specific API key."""
 
-    def __init__(self, max_rps: int, batch_size: int):
-        self.queue: asyncio.Queue = asyncio.Queue()
+    def __init__(self, max_rps: int, batch_size: int, maxsize: int = 0):
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         self.max_rps = max(1, max_rps)
         self.batch_size = max(1, batch_size)
+        self.session: aiohttp.ClientSession | None = None
         self.task = asyncio.create_task(self._run())
 
     async def enqueue_http(self, method: str, url: str,
@@ -86,7 +90,7 @@ class _RequestWorker:
         return await loop.run_in_executor(None, partial)
 
     async def _run(self) -> None:
-        session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession()
         try:
             while True:
                 fut, a, b, c, is_call = await self.queue.get()
@@ -103,7 +107,7 @@ class _RequestWorker:
                     if is_call:
                         coros.append(self._exec_call(a, b, c))
                     else:
-                        coros.append(self._fetch(session, a, b, c))
+                        coros.append(self._fetch(self.session, a, b, c))
 
                 results = await asyncio.gather(*coros, return_exceptions=True)
                 for (fut, *_), result in zip(batch, results):
@@ -117,4 +121,12 @@ class _RequestWorker:
                 if elapsed < min_interval:
                     await asyncio.sleep(min_interval - elapsed)
         finally:
-            await session.close()
+            await self.session.close()
+
+    async def shutdown(self) -> None:
+        if not self.task.done():
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.task
+        if self.session and not self.session.closed:
+            await self.session.close()
