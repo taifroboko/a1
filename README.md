@@ -58,31 +58,35 @@ LOG_LEVEL=INFO
 
 ### Basic Usage
 
-Run the A1 system on a list of target contracts:
+Contract addresses are distributed to workers through a RabbitMQ queue.  To
+process jobs locally, start a worker pointed at the queue:
 
 ```bash
-python main.py --targets targets.txt
+python workers/analyzer_worker.py
 ```
+
+To analyse a single contract without the queue, pass the address directly:
+
+```bash
+python main.py --contract 0x1234567890123456789012345678901234567890
+```
+
+### Enqueuing Contracts
+
+Producers can enqueue jobs using the :mod:`core.queue` module or any AMQP
+client.  Each job is a JSON object with ``address`` and ``network`` fields.
 
 ### Advanced Options
 
 ```bash
-# Run with custom configuration
-python main.py --targets targets.txt --max-iterations 3 --output-dir ./custom_results
+# Run worker with higher concurrency
+A1_WORKER_CONCURRENCY=5 python workers/analyzer_worker.py
 
-# Run on a single contract
-python main.py --contract 0x1234567890123456789012345678901234567890
+# Specify custom queue location
+python main.py --queue-url amqp://guest:guest@localhost/ --queue-name contract_targets
 
 # Run with verbose logging
-python main.py --targets targets.txt --log-level DEBUG
-```
-
-### Target File Format
-
-Create a `targets.txt` file with one contract address per line:
-```
-0x1234567890123456789012345678901234567890
-0xabcdefabcdefabcdefabcdefabcdefabcdefabcd
+python main.py --contract 0x1234... --verbose
 ```
 
 ### Simple Test
@@ -136,6 +140,47 @@ Key configuration options in `.env`:
 4. **Code Sanitizer**: Cleans and optimizes contract code for analysis
 5. **Concrete Execution**: Simulates exploits using Foundry/Forge
 6. **Revenue Normalizer**: Calculates economic profitability with real-time prices
+
+## 🚀 Deployment
+
+Multiple workers can consume contracts from the shared queue.  This allows the
+analysis to scale across machines.
+
+### systemd
+
+```ini
+[Unit]
+Description=A1 analyzer worker
+After=network.target
+
+[Service]
+Environment=QUEUE_URL=amqp://user:pass@mq/
+ExecStart=/usr/bin/python workers/analyzer_worker.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Kubernetes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: a1-worker
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: worker
+        image: your-image
+        env:
+        - name: QUEUE_URL
+          value: amqp://user:pass@rabbitmq/
+        command: ["python", "workers/analyzer_worker.py"]
+```
 
 ## 🧪 Testing
 

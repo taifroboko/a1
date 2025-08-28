@@ -18,6 +18,8 @@ import logging
 import openai
 from openai import AsyncOpenAI
 
+from core.queue import ContractQueue, QueueItem
+
 from tools.source_code_fetcher import SourceCodeFetcher
 from tools.constructor_parameter import ConstructorParameterTool
 from tools.state_reader import BlockchainStateReader
@@ -86,31 +88,38 @@ class A1Agent:
     through iterative refinement with 5-iteration budget management.
     """
     
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], queue: Optional[ContractQueue] = None):
+        """Initialize the A1 Agent.
+
+        Parameters
+        ----------
+        config:
+            Configuration dictionary with API keys and settings.
+        queue:
+            Optional :class:`ContractQueue` instance.  When provided the agent is
+            able to pull analysis targets directly from the queue when a target
+            address is not explicitly supplied.
         """
-        Initialize the A1 Agent.
-        
-        Args:
-            config: Configuration dictionary with API keys and settings
-        """
+
         self.config = config
-        
+        self.queue = queue
+
         self.grok_client = AsyncOpenAI(
             api_key=config.get('GROK_API_KEY'),
             base_url=config.get('GROK_BASE_URL', 'https://api.x.ai/v1')
         )
-        
+
         self.tools = self._initialize_tools()
-        
+
         self.max_iterations = config.get('MAX_ITERATIONS', 5)
         self.base_budget_per_iteration = config.get('BASE_BUDGET_PER_ITERATION', 1000)
         self.diminishing_factor = config.get('DIMINISHING_FACTOR', 0.8)
         self.confidence_threshold = config.get('CONFIDENCE_THRESHOLD', 0.7)
-        
+
         self.state: Optional[AgentState] = None
-        
+
         self.phase_prompts = self._initialize_phase_prompts()
-        
+
         self.attention_weights = {
             'source_code': 1.0,
             'constructor_params': 0.8,
@@ -271,17 +280,27 @@ Provide final recommendations with confidence scores, profit projections, and ri
 """
         }
     
-    async def initialize_session(self, target_contract: str, chain: str = 'ethereum') -> str:
-        """
-        Initialize a new exploit generation session.
-        
+    async def initialize_session(self, target_contract: Optional[str] = None, chain: str = 'ethereum') -> str:
+        """Initialize a new exploit generation session.
+
+        If ``target_contract`` is ``None`` the agent attempts to retrieve the
+        next target from the configured :class:`ContractQueue`.
+
         Args:
-            target_contract: Target contract address
+            target_contract: Optional target contract address
             chain: Blockchain network ('ethereum' or 'bsc')
-            
+
         Returns:
             Session ID for tracking
         """
+
+        if target_contract is None:
+            if not self.queue:
+                raise ValueError("No target contract provided and no queue configured")
+            item: QueueItem = await self.queue.dequeue()
+            target_contract = item.address
+            chain = item.network
+
         session_id = f"a1_{int(time.time())}_{target_contract[:8]}"
         
         self.state = AgentState(
@@ -300,14 +319,16 @@ Provide final recommendations with confidence scores, profit projections, and ri
         logger.info(f"Initialized A1 session {session_id} for contract {target_contract}")
         return session_id
     
-    async def execute_full_analysis(self, target_contract: str, chain: str = 'ethereum') -> Dict[str, Any]:
-        """
-        Execute the complete 5-iteration exploit generation process.
-        
+    async def execute_full_analysis(self, target_contract: Optional[str] = None, chain: str = 'ethereum') -> Dict[str, Any]:
+        """Execute the complete 5-iteration exploit generation process.
+
+        When ``target_contract`` is ``None`` the agent will pull the next job
+        from its queue if one has been configured.
+
         Args:
-            target_contract: Target contract address
+            target_contract: Optional target contract address
             chain: Blockchain network
-            
+
         Returns:
             Complete analysis results with generated strategies
         """
