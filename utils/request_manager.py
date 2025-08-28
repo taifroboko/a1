@@ -14,6 +14,7 @@ class RequestManager:
     """
 
     _workers: Dict[str, "_RequestWorker"] = {}
+    _worker_counts: Dict[str, int] = {}
 
     def __init__(self, api_key: str,
                  max_requests_per_second: int = 5,
@@ -26,14 +27,24 @@ class RequestManager:
             RequestManager._workers[self.api_key] = _RequestWorker(
                 max_requests_per_second, max_batch_size, maxsize=queue_maxsize
             )
+            RequestManager._worker_counts[self.api_key] = 0
+        RequestManager._worker_counts[self.api_key] += 1
         self.worker = RequestManager._workers[self.api_key]
 
     async def __aenter__(self) -> "RequestManager":
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self.worker.shutdown()
-        RequestManager._workers.pop(self.api_key, None)
+        count = RequestManager._worker_counts.get(self.api_key)
+        if count is None:
+            return None
+        count -= 1
+        if count <= 0:
+            await self.worker.shutdown()
+            RequestManager._workers.pop(self.api_key, None)
+            RequestManager._worker_counts.pop(self.api_key, None)
+        else:
+            RequestManager._worker_counts[self.api_key] = count
         return None
 
     async def get(self, url: str, **kwargs) -> Any:
