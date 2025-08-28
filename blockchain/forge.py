@@ -569,7 +569,7 @@ contract ExploitTest is TestBase {
             logger.error(f"Failed to simulate transaction: {e}")
             raise
 
-    async def craft_mainnet_tx(self, strategy: Any) -> Dict[str, Any]:
+    async def craft_mainnet_tx(self, strategy: Any, network: ForgeNetwork = ForgeNetwork.ETHEREUM) -> Dict[str, Any]:
         """Craft and sign a raw transaction for mainnet execution.
 
         This helper constructs a basic transaction from an ``ExploitStrategy``
@@ -582,6 +582,8 @@ contract ExploitTest is TestBase {
                 minimum an ``execution_steps`` entry.  Only the first step is
                 used which should provide ``to``, ``data`` and optional
                 ``value`` fields.
+            network: Target network for transaction parameters. Defaults to
+                :class:`ForgeNetwork.ETHEREUM`.
 
         Returns:
             Dict containing the signed raw transaction and metadata.
@@ -612,7 +614,7 @@ contract ExploitTest is TestBase {
         data = first_step.get('data', '0x')
         value = int(first_step.get('value', 0))
 
-        network_cfg = self.networks.get(ForgeNetwork.ETHEREUM)
+        network_cfg = self.networks.get(network)
         gas = network_cfg["gas_limit"]
         gas_price = network_cfg["gas_price"]
         chain_id = network_cfg["chain_id"]
