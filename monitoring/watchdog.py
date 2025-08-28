@@ -64,6 +64,10 @@ class WorkerWatchdog:
         thread = threading.Thread(target=self.worker_fn, daemon=True)
         thread.start()
         self._worker_thread = thread
+        # Reset heartbeat so the new worker has a full stall window to report
+        # liveness. Without this, the watchdog may immediately restart the
+        # worker again using the stale timestamp from the previous run.
+        self.metrics.record_heartbeat(self.heartbeat_name)
         logger.info("worker started by watchdog")
 
     def _monitor(self) -> None:

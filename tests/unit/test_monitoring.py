@@ -41,3 +41,23 @@ def test_watchdog_restarts_and_alerts():
 
     assert metrics.counters["watchdog_restarts"] >= 1
     assert metrics.counters["watchdog_alerts"] >= 1
+
+
+def test_watchdog_resets_heartbeat_on_restart():
+    metrics = MetricsCollector({"ENABLE_METRICS": True})
+    # Seed an old heartbeat value
+    metrics.record_heartbeat("worker")
+    old = metrics.get_last_heartbeat("worker")
+    time.sleep(0.01)
+
+    watchdog = WorkerWatchdog(
+        worker_fn=lambda: None,
+        metrics=metrics,
+        heartbeat_name="worker",
+    )
+
+    # Starting the worker should reset the heartbeat timestamp
+    watchdog._start_worker()
+    new = metrics.get_last_heartbeat("worker")
+
+    assert new > old
