@@ -154,8 +154,13 @@ class ContractProcessor:
             self.feedback_processor = FeedbackProcessor(self.config)
             self.strategy_generator = StrategyGenerator(self.config)
             self.orchestrator = ToolOrchestrator(self.tools, self.config)
-            
-            self.agent = A1Agent(self.config)
+
+            self.agent = A1Agent(
+                self.config,
+                blockchain_client=self.blockchain_client,
+                forge=self.forge,
+                result_storage=self.result_storage,
+            )
             
             self.is_initialized = True
             logger.info("A1 Agentic System initialized successfully")

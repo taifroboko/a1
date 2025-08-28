@@ -297,7 +297,27 @@ class ResultStorage:
         except Exception as e:
             logger.error(f"Failed to get statistics: {e}")
             return {}
-    
+
+    async def record_transaction_outcome(self, session_id: str, tx_hash: str,
+                                         success: bool,
+                                         details: Optional[Dict[str, Any]] = None):
+        """Record the outcome of an executed transaction."""
+        try:
+            tx_dir = self.data_dir / 'transactions'
+            tx_dir.mkdir(exist_ok=True)
+            record = {
+                'session_id': session_id,
+                'tx_hash': tx_hash,
+                'success': success,
+                'timestamp': time.time(),
+                'details': details or {}
+            }
+            file_path = tx_dir / f"{session_id}_{tx_hash or 'failed'}.json"
+            await asyncio.to_thread(lambda: file_path.write_text(json.dumps(record, indent=2)))
+            logger.info(f"Recorded transaction outcome for session {session_id}")
+        except Exception as e:
+            logger.error(f"Failed to record transaction outcome: {e}")
+
     async def close(self):
         """Close storage connections and cleanup."""
         try:

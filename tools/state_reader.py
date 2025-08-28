@@ -529,3 +529,7 @@ class BlockchainStateReader:
                 critical_vars['timestamps'][func_name] = value
         
         return critical_vars
+
+
+# Backwards compatibility alias
+StateReader = BlockchainStateReader

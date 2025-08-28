@@ -27,6 +27,9 @@ from tools.state_reader import BlockchainStateReader
 from tools.code_sanitizer import CodeSanitizer
 from tools.concrete_execution import ConcreteExecutionTool
 from tools.revenue_normalizer import RevenueNormalizer
+from blockchain.client import NetworkType, BlockchainClient
+from blockchain.forge import ForgeIntegration
+from storage.result_storage import ResultStorage
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +83,7 @@ class AgentState:
     confidence_progression: List[float]
     diminishing_returns_factor: float
     session_start_time: int
+    network: str = 'ethereum'
 
 class A1Agent:
     """
@@ -89,7 +93,10 @@ class A1Agent:
     through iterative refinement with 5-iteration budget management.
     """
     
-    def __init__(self, config: Dict[str, Any], queue: Optional[ContractQueue] = None):
+    def __init__(self, config: Dict[str, Any], queue: Optional[ContractQueue] = None,
+                 blockchain_client: Optional[BlockchainClient] = None,
+                 forge: Optional[ForgeIntegration] = None,
+                 result_storage: Optional[ResultStorage] = None):
         """Initialize the A1 Agent.
 
         Parameters
@@ -104,6 +111,9 @@ class A1Agent:
 
         self.config = config
         self.queue = queue
+        self.blockchain_client = blockchain_client
+        self.forge = forge
+        self.result_storage = result_storage
 
         self.grok_client = AsyncOpenAI(
             api_key=config.get('GROK_API_KEY'),
@@ -118,6 +128,7 @@ class A1Agent:
         self.confidence_threshold = config.get('CONFIDENCE_THRESHOLD', 0.7)
 
         self.state: Optional[AgentState] = None
+        self.session_id: Optional[str] = None
 
         self.phase_prompts = self._initialize_phase_prompts()
 
@@ -307,7 +318,8 @@ Provide final recommendations with confidence scores, profit projections, and ri
             chain = item.network
 
         session_id = f"a1_{int(time.time())}_{target_contract[:8]}"
-        
+        self.session_id = session_id
+
         self.state = AgentState(
             current_iteration=0,
             current_phase=IterationPhase.RECONNAISSANCE,
@@ -318,9 +330,10 @@ Provide final recommendations with confidence scores, profit projections, and ri
             findings_history=[],
             confidence_progression=[],
             diminishing_returns_factor=1.0,
-            session_start_time=int(time.time())
+            session_start_time=int(time.time()),
+            network=chain
         )
-        
+
         logger.info(f"Initialized A1 session {session_id} for contract {target_contract}")
         return session_id
     
@@ -368,7 +381,42 @@ Provide final recommendations with confidence scores, profit projections, and ri
             await asyncio.sleep(1)
         
         final_analysis = await self._generate_final_analysis(iteration_results)
-        
+
+        # After successful validation attempt to craft and send the mainnet
+        # transaction for the highest confidence strategy.  This execution is
+        # intentionally best-effort – failures are logged but do not raise in
+        # order to keep analysis results available even when broadcasting
+        # transactions is not possible (e.g. in offline tests).
+        try:
+            if iteration_results:
+                last_result = iteration_results[-1]
+                if (
+                    last_result.phase == IterationPhase.VALIDATION and
+                    last_result.success and
+                    self.forge and self.blockchain_client and
+                    self.state.strategies_generated
+                ):
+                    best_strategy = max(
+                        self.state.strategies_generated,
+                        key=lambda s: s.confidence_score
+                    )
+                    if best_strategy.confidence_score >= self.confidence_threshold:
+                        tx = await self.forge.craft_mainnet_tx(best_strategy)
+                        network = NetworkType.ETHEREUM if self.state.network == 'ethereum' else NetworkType.BSC
+                        tx_hash = await self.blockchain_client.send_raw_transaction(network, tx['raw_tx'])
+                        final_analysis['execution_tx'] = tx_hash
+                        if self.result_storage and self.session_id:
+                            await self.result_storage.record_transaction_outcome(
+                                self.session_id, tx_hash, True,
+                                {'strategy_id': best_strategy.strategy_id}
+                            )
+        except Exception as e:  # pragma: no cover - network operations
+            logger.error(f"Failed to execute validated strategy: {e}")
+            if self.result_storage and self.session_id:
+                await self.result_storage.record_transaction_outcome(
+                    self.session_id, '', False, {'error': str(e)}
+                )
+
         logger.info(f"Completed A1 analysis for {target_contract}")
         return final_analysis
     

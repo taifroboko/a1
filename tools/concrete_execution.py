@@ -790,3 +790,7 @@ contract ExploitTest is Test {
             'execution_count': len(execution_results),
             'success_rate': sum(1 for r in execution_results if r.success) / max(len(execution_results), 1)
         }
+
+
+# Backwards compatibility alias
+ConcreteExecution = ConcreteExecutionTool

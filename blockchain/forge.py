@@ -568,6 +568,86 @@ contract ExploitTest is TestBase {
         except Exception as e:
             logger.error(f"Failed to simulate transaction: {e}")
             raise
+
+    async def craft_mainnet_tx(self, strategy: Any) -> Dict[str, Any]:
+        """Craft and sign a raw transaction for mainnet execution.
+
+        This helper constructs a basic transaction from an ``ExploitStrategy``
+        (or compatible ``dict``) and signs it using the private key supplied in
+        the system configuration.  The implementation deliberately avoids any
+        network calls so it can operate in offline or test environments.
+
+        Args:
+            strategy: :class:`ExploitStrategy` instance or ``dict`` containing at
+                minimum an ``execution_steps`` entry.  Only the first step is
+                used which should provide ``to``, ``data`` and optional
+                ``value`` fields.
+
+        Returns:
+            Dict containing the signed raw transaction and metadata.
+        """
+
+        try:
+            from eth_account import Account
+            from web3 import Web3
+        except Exception as exc:  # pragma: no cover - dependencies are ensured in tests
+            logger.error(f"Missing signing dependencies: {exc}")
+            raise
+
+        # Extract the first execution step.  The strategy object may be a
+        # dataclass or a simple dictionary depending on caller context.
+        step: Dict[str, Any]
+        if isinstance(strategy, dict):
+            steps = strategy.get('execution_steps', [])
+            target = strategy.get('target_contract')
+        else:
+            steps = getattr(strategy, 'execution_steps', [])
+            target = getattr(strategy, 'target_contract', None)
+
+        if not steps:
+            raise ValueError("Strategy does not contain execution steps")
+
+        first_step = steps[0] if isinstance(steps, list) else steps
+        to_address = first_step.get('to') or target
+        data = first_step.get('data', '0x')
+        value = int(first_step.get('value', 0))
+
+        network_cfg = self.networks.get(ForgeNetwork.ETHEREUM)
+        gas = network_cfg["gas_limit"]
+        gas_price = network_cfg["gas_price"]
+        chain_id = network_cfg["chain_id"]
+
+        private_key = self.config.get('EXECUTOR_PRIVATE_KEY') or self.config.get('PRIVATE_KEY')
+        if not private_key:
+            # Generate ephemeral key for testing if none supplied.  The
+            # resulting transaction will still be well-formed but useless on a
+            # live network.
+            acct = Account.create()
+            private_key = acct.key.hex()
+        account = Account.from_key(private_key)
+
+        # Nonce defaults to zero to keep the method self contained and avoid
+        # external RPC calls in tests.
+        nonce = first_step.get('nonce', 0)
+
+        tx = {
+            'to': Web3.to_checksum_address(to_address) if to_address else None,
+            'value': value,
+            'data': data,
+            'gas': gas,
+            'gasPrice': gas_price,
+            'nonce': nonce,
+            'chainId': chain_id,
+        }
+
+        signed = Account.sign_transaction(tx, private_key)
+
+        return {
+            'raw_tx': signed.rawTransaction.hex(),
+            'hash': signed.hash.hex(),
+            'from': account.address,
+            'tx': tx,
+        }
     
     async def create_snapshot(self, project_name: str, snapshot_name: str) -> str:
         """

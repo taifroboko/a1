@@ -704,5 +704,9 @@ class BlockchainScanner:
         self.source_code_cache.clear()
         self.transaction_cache.clear()
         self.token_cache.clear()
-        
+
         logger.info("Blockchain scanner closed")
+
+
+# Backwards compatibility alias
+ScannerIntegration = BlockchainScanner
