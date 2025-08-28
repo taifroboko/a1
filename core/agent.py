@@ -11,7 +11,8 @@ Based on the A1 research paper specifications.
 import asyncio
 import json
 import time
-from typing import Dict, List, Optional, Any, Tuple
+import hashlib
+from typing import Dict, List, Optional, Any, Tuple, Union
 from dataclasses import dataclass, asdict
 from enum import Enum
 import logging
@@ -27,6 +28,7 @@ from tools.state_reader import BlockchainStateReader
 from tools.code_sanitizer import CodeSanitizer
 from tools.concrete_execution import ConcreteExecutionTool
 from tools.revenue_normalizer import RevenueNormalizer
+from storage.result_storage import ResultStorage, StoredResult
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +91,7 @@ class A1Agent:
     through iterative refinement with 5-iteration budget management.
     """
     
-    def __init__(self, config: Dict[str, Any], queue: Optional[ContractQueue] = None):
+    def __init__(self, config: Dict[str, Any], queue: Optional[ContractQueue] = None, result_storage: Optional[ResultStorage] = None):
         """Initialize the A1 Agent.
 
         Parameters
@@ -104,6 +106,7 @@ class A1Agent:
 
         self.config = config
         self.queue = queue
+        self.result_storage = result_storage
 
         self.grok_client = AsyncOpenAI(
             api_key=config.get('GROK_API_KEY'),
@@ -129,6 +132,9 @@ class A1Agent:
             'execution_simulation': 1.0,
             'revenue_analysis': 0.9
         }
+
+        self.current_source_hash: Optional[str] = None
+        self.current_state_hash: Optional[str] = None
     
     def _initialize_tools(self) -> Dict[str, Any]:
         """Initialize all domain-specific tools."""
@@ -285,7 +291,7 @@ Provide final recommendations with confidence scores, profit projections, and ri
 """
         }
     
-    async def initialize_session(self, target_contract: Optional[str] = None, chain: str = 'ethereum') -> str:
+    async def initialize_session(self, target_contract: Optional[str] = None, chain: str = 'ethereum', force: bool = False) -> Union[str, StoredResult]:
         """Initialize a new exploit generation session.
 
         If ``target_contract`` is ``None`` the agent attempts to retrieve the
@@ -294,9 +300,10 @@ Provide final recommendations with confidence scores, profit projections, and ri
         Args:
             target_contract: Optional target contract address
             chain: Blockchain network ('ethereum' or 'bsc')
+            force: When True, bypass cache even if hashes match
 
         Returns:
-            Session ID for tracking
+            Session ID for tracking or a cached :class:`StoredResult`
         """
 
         if target_contract is None:
@@ -306,8 +313,32 @@ Provide final recommendations with confidence scores, profit projections, and ri
             target_contract = item.address
             chain = item.network
 
+        # Compute source and state hashes for caching
+        try:
+            fetcher: SourceCodeFetcher = self.tools['source_code_fetcher']
+            source_info = await fetcher.fetch_contract_source(target_contract)
+            self.current_source_hash = hashlib.sha256(source_info.source_code.encode()).hexdigest()
+
+            state_reader: BlockchainStateReader = self.tools['state_reader']
+            snapshot = await state_reader.capture_state_snapshot(target_contract, source_info.abi)
+            state_serialized = json.dumps(snapshot.state_data, sort_keys=True)
+            self.current_state_hash = hashlib.sha256(state_serialized.encode()).hexdigest()
+
+            if not force and self.result_storage:
+                cached = await self.result_storage.get_cached_result(
+                    target_contract,
+                    chain,
+                    self.current_source_hash,
+                    self.current_state_hash
+                )
+                if cached:
+                    logger.info(f"Using cached result for {target_contract} on {chain}")
+                    return cached
+        except Exception as e:
+            logger.debug(f"Cache lookup failed for {target_contract}: {e}")
+
         session_id = f"a1_{int(time.time())}_{target_contract[:8]}"
-        
+
         self.state = AgentState(
             current_iteration=0,
             current_phase=IterationPhase.RECONNAISSANCE,
@@ -320,11 +351,11 @@ Provide final recommendations with confidence scores, profit projections, and ri
             diminishing_returns_factor=1.0,
             session_start_time=int(time.time())
         )
-        
+
         logger.info(f"Initialized A1 session {session_id} for contract {target_contract}")
         return session_id
     
-    async def execute_full_analysis(self, target_contract: Optional[str] = None, chain: str = 'ethereum') -> Dict[str, Any]:
+    async def execute_full_analysis(self, target_contract: Optional[str] = None, chain: str = 'ethereum', force: bool = False) -> Union[Dict[str, Any], StoredResult]:
         """Execute the complete 5-iteration exploit generation process.
 
         When ``target_contract`` is ``None`` the agent will pull the next job
@@ -337,26 +368,31 @@ Provide final recommendations with confidence scores, profit projections, and ri
         Returns:
             Complete analysis results with generated strategies
         """
-        session_id = await self.initialize_session(target_contract, chain)
-        
+        init_result = await self.initialize_session(target_contract, chain, force)
+
+        if isinstance(init_result, StoredResult):
+            return init_result
+
+        session_id = init_result
+
         logger.info(f"Starting full A1 analysis for {target_contract}")
-        
+
         iteration_results = []
-        
+
         for iteration in range(1, self.max_iterations + 1):
             logger.info(f"Executing iteration {iteration}/{self.max_iterations}")
-            
+
             iteration_budget = int(
-                self.base_budget_per_iteration * 
+                self.base_budget_per_iteration *
                 (self.diminishing_factor ** (iteration - 1))
             )
-            
+
             self.state.current_iteration = iteration
             self.state.iteration_budgets.append(iteration_budget)
-            
+
             result = await self._execute_iteration(iteration, iteration_budget)
             iteration_results.append(result)
-            
+
             self.state.total_budget_used += result.token_usage.get('total_tokens', 0)
             self.state.confidence_progression.append(result.confidence_score)
             self.state.findings_history.append(result.findings)
