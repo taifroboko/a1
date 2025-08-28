@@ -16,6 +16,9 @@ from enum import Enum
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+from collections import defaultdict
+
+from monitoring.metrics import record_error, record_heartbeat, set_queue_depth
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +98,10 @@ class ToolOrchestrator:
         self.default_timeout = config.get('DEFAULT_TOOL_TIMEOUT', 300)  # 5 minutes
         self.max_retries = config.get('MAX_TOOL_RETRIES', 2)
         self.resource_budget = config.get('RESOURCE_BUDGET_PER_ITERATION', 1000)
+
+        self.watchdog_restart_limit = config.get('WATCHDOG_RESTART_LIMIT', 1)
+        self.watchdog_escalate_threshold = config.get('WATCHDOG_ESCALATE_THRESHOLD', 3)
+        self.tool_failure_counts = defaultdict(int)
         
         self.tool_metadata = self._initialize_tool_metadata()
         
@@ -662,6 +669,7 @@ class ToolOrchestrator:
         Returns:
             Workflow execution results
         """
+        record_heartbeat()
         logger.info(f"Executing workflow {workflow_plan.plan_id} with {len(workflow_plan.tool_executions)} tools")
         
         start_time = time.time()
@@ -669,6 +677,7 @@ class ToolOrchestrator:
         failed_executions = []
         
         for group_idx, parallel_group in enumerate(workflow_plan.parallel_groups):
+            set_queue_depth(len(workflow_plan.parallel_groups) - group_idx)
             logger.info(f"Executing parallel group {group_idx + 1}/{len(workflow_plan.parallel_groups)}: {parallel_group}")
             
             group_results = await self._execute_parallel_group(parallel_group, workflow_plan, context)
@@ -723,6 +732,7 @@ class ToolOrchestrator:
         Returns:
             Dictionary mapping tool names to execution results
         """
+        set_queue_depth(len(parallel_group))
         tasks = []
         
         for tool_name in parallel_group:
@@ -773,68 +783,86 @@ class ToolOrchestrator:
         return results
     
     async def _execute_single_tool(self, execution: ToolExecution, context: Dict[str, Any]) -> ExecutionResult:
-        """
-        Execute a single tool with retry logic and error handling.
-        
-        Args:
-            execution: Tool execution configuration
-            context: Execution context
-            
-        Returns:
-            Execution result
-        """
-        start_time = time.time()
-        last_error = None
-        
-        for attempt in range(execution.retry_count + 1):
-            try:
-                logger.debug(f"Executing {execution.tool_name}.{execution.method_name} (attempt {attempt + 1})")
-                
-                tool = self.tools.get(execution.tool_name)
-                if not tool:
-                    raise ValueError(f"Tool {execution.tool_name} not available")
-                
-                method = getattr(tool, execution.method_name, None)
-                if not method:
-                    raise ValueError(f"Method {execution.method_name} not found on {execution.tool_name}")
-                
-                result = await asyncio.wait_for(
-                    method(**execution.parameters),
-                    timeout=execution.timeout
+        """Execute a single tool with retry, restart and error tracking."""
+
+        for restart_attempt in range(self.watchdog_restart_limit + 1):
+            start_time = time.time()
+            last_error = None
+
+            for attempt in range(execution.retry_count + 1):
+                try:
+                    logger.debug(
+                        f"Executing {execution.tool_name}.{execution.method_name} "
+                        f"(attempt {attempt + 1}, restart {restart_attempt})"
+                    )
+
+                    tool = self.tools.get(execution.tool_name)
+                    if not tool:
+                        raise ValueError(f"Tool {execution.tool_name} not available")
+
+                    method = getattr(tool, execution.method_name, None)
+                    if not method:
+                        raise ValueError(f"Method {execution.method_name} not found on {execution.tool_name}")
+
+                    result = await asyncio.wait_for(
+                        method(**execution.parameters),
+                        timeout=execution.timeout,
+                    )
+
+                    execution_time = time.time() - start_time
+
+                    resource_usage = {
+                        'cost': execution.estimated_cost,
+                        'execution_time': execution_time,
+                        'memory_usage': 0,  # Would be measured in real implementation
+                        'api_calls': 1,
+                    }
+
+                    return ExecutionResult(
+                        tool_name=execution.tool_name,
+                        method_name=execution.method_name,
+                        success=True,
+                        result=result,
+                        execution_time=execution_time,
+                        resource_usage=resource_usage,
+                        retry_attempts=attempt,
+                    )
+
+                except asyncio.TimeoutError:
+                    last_error = f"Execution timeout after {execution.timeout}s"
+                    record_error()
+                    logger.warning(
+                        f"{execution.tool_name}.{execution.method_name} timed out "
+                        f"(attempt {attempt + 1}, restart {restart_attempt})"
+                    )
+
+                except Exception as e:
+                    last_error = str(e)
+                    record_error()
+                    logger.warning(
+                        f"{execution.tool_name}.{execution.method_name} failed: {e} "
+                        f"(attempt {attempt + 1}, restart {restart_attempt})"
+                    )
+
+                if attempt < execution.retry_count:
+                    await asyncio.sleep(1.0 * (attempt + 1))  # Exponential backoff
+
+            # After retry attempts exhausted
+            self.tool_failure_counts[execution.tool_name] += 1
+            if self.tool_failure_counts[execution.tool_name] >= self.watchdog_escalate_threshold:
+                self._escalate_failure(execution.tool_name, last_error)
+                break
+
+            if restart_attempt < self.watchdog_restart_limit:
+                logger.info(
+                    f"Watchdog restarting {execution.tool_name} after failure"
                 )
-                
-                execution_time = time.time() - start_time
-                
-                resource_usage = {
-                    'cost': execution.estimated_cost,
-                    'execution_time': execution_time,
-                    'memory_usage': 0,  # Would be measured in real implementation
-                    'api_calls': 1
-                }
-                
-                return ExecutionResult(
-                    tool_name=execution.tool_name,
-                    method_name=execution.method_name,
-                    success=True,
-                    result=result,
-                    execution_time=execution_time,
-                    resource_usage=resource_usage,
-                    retry_attempts=attempt
-                )
-                
-            except asyncio.TimeoutError:
-                last_error = f"Execution timeout after {execution.timeout}s"
-                logger.warning(f"{execution.tool_name}.{execution.method_name} timed out (attempt {attempt + 1})")
-                
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"{execution.tool_name}.{execution.method_name} failed: {e} (attempt {attempt + 1})")
-            
-            if attempt < execution.retry_count:
-                await asyncio.sleep(1.0 * (attempt + 1))  # Exponential backoff
-        
+                self._restart_tool(execution.tool_name)
+                continue
+
+            break
+
         execution_time = time.time() - start_time
-        
         return ExecutionResult(
             tool_name=execution.tool_name,
             method_name=execution.method_name,
@@ -843,7 +871,7 @@ class ToolOrchestrator:
             execution_time=execution_time,
             resource_usage={'cost': 0},
             error_message=last_error,
-            retry_attempts=execution.retry_count
+            retry_attempts=execution.retry_count,
         )
     
     def _extract_context_updates(self, group_results: Dict[str, ExecutionResult]) -> Dict[str, Any]:
@@ -879,8 +907,32 @@ class ToolOrchestrator:
                         context_updates['fork_id'] = result.result
                     elif result.method_name == 'setup_forge_project':
                         context_updates['project_path'] = result.result
-        
+
         return context_updates
+
+    def _restart_tool(self, tool_name: str) -> None:
+        """Attempt to restart a tool after a failure."""
+
+        tool = self.tools.get(tool_name)
+        if not tool:
+            return
+        try:
+            if hasattr(tool, 'restart'):
+                tool.restart()
+            else:
+                tool_cls = tool.__class__
+                config = getattr(tool, 'config', {})
+                self.tools[tool_name] = tool_cls(**config) if config else tool_cls()
+            logger.info(f"Tool {tool_name} restarted by watchdog")
+        except Exception as e:
+            logger.error(f"Failed to restart tool {tool_name}: {e}")
+
+    def _escalate_failure(self, tool_name: str, error: Optional[str]) -> None:
+        """Escalate repeated tool failures for external handling."""
+
+        logger.critical(
+            f"Tool {tool_name} failed repeatedly: {error}. Escalating to supervisor"
+        )
     
     def _update_performance_metrics(self, execution_results: Dict[str, ExecutionResult]):
         """
