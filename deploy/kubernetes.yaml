@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: a1-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: a1-agent
+  template:
+    metadata:
+      labels:
+        app: a1-agent
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: a1-agent
+          image: a1-agent:latest
+          ports:
+            - containerPort: 8000
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources: {}
+          imagePullPolicy: IfNotPresent
