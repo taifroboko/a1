@@ -23,6 +23,7 @@ from core.agent import A1Agent
 from core.orchestrator import ToolOrchestrator
 from core.feedback import FeedbackProcessor
 from core.strategy import StrategyGenerator
+from core.queue import ContractQueue, QueueItem
 
 from tools.source_code_fetcher import SourceCodeFetcher
 from tools.constructor_parameter import ConstructorParameterTool
@@ -606,6 +607,36 @@ class ContractProcessor:
         
         logger.info(f"Batch processing completed: {len(results)} results")
         return results
+
+    async def process_queue(self, queue: ContractQueue, max_concurrent: int = 3) -> None:
+        """Continuously process contracts from a message queue.
+
+        Args:
+            queue: :class:`ContractQueue` instance to pull jobs from.
+            max_concurrent: Maximum number of concurrent analyses.
+        """
+
+        if not self.is_initialized:
+            raise RuntimeError("System not initialized. Call initialize() first.")
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+        active: set[asyncio.Task] = set()
+
+        async def handle(item: QueueItem):
+            async with semaphore:
+                target = ContractTarget(address=item.address, network=item.network)
+                await self.process_contract(target)
+
+        try:
+            async for item in queue.consume():
+                task = asyncio.create_task(handle(item))
+                active.add(task)
+                task.add_done_callback(lambda t: active.discard(t))
+        except asyncio.CancelledError:
+            pass
+
+        if active:
+            await asyncio.gather(*active)
     
     def get_performance_stats(self) -> Dict[str, Any]:
         """Get system performance statistics."""
@@ -697,7 +728,8 @@ async def main():
     parser = argparse.ArgumentParser(description="A1 Agentic System - Autonomous Smart Contract Exploit Generation")
     
     parser.add_argument('--config', '-c', default='.env', help='Configuration file path')
-    parser.add_argument('--targets', '-t', help='Targets file path')
+    parser.add_argument('--queue-url', help='AMQP URL for the contract queue')
+    parser.add_argument('--queue-name', default='contract_targets', help='Queue name')
     parser.add_argument('--contract', help='Single contract address to analyze')
     parser.add_argument('--network', default='ethereum', help='Network name (ethereum, bsc)')
     parser.add_argument('--max-concurrent', type=int, default=3, help='Maximum concurrent executions')
@@ -716,65 +748,37 @@ async def main():
     
     try:
         await processor.initialize()
-        
-        targets = []
-        
+
         if args.contract:
-            targets = [ContractTarget(
+            target = ContractTarget(
                 address=args.contract,
                 network=args.network,
                 name=f"Manual_{args.contract[:8]}"
-            )]
-        elif args.targets:
-            targets = await load_targets_from_file(args.targets)
-        else:
-            default_targets = Path(__file__).parent / "attachments" / "targets.txt"
-            if default_targets.exists():
-                targets = await load_targets_from_file(str(default_targets))
-            else:
-                logger.error("No targets specified. Use --contract or --targets")
-                return 1
-        
-        if not targets:
-            logger.error("No valid targets found")
-            return 1
-        
-        if len(targets) == 1:
+            )
             logger.info("Processing single contract...")
-            results = [await processor.process_contract(targets[0])]
-        else:
-            logger.info(f"Processing {len(targets)} contracts in batch mode...")
-            results = await processor.process_batch(targets, args.max_concurrent)
-        
-        successful = sum(1 for r in results if r.success)
-        total_exploits = sum(r.exploits_found for r in results)
-        total_profit = sum(r.total_profit_potential for r in results)
-        
-        logger.info(f"\n=== EXECUTION SUMMARY ===")
-        logger.info(f"Contracts processed: {len(results)}")
-        logger.info(f"Successful analyses: {successful}")
-        logger.info(f"Success rate: {successful/len(results)*100:.1f}%")
-        logger.info(f"Total exploits found: {total_exploits}")
-        logger.info(f"Total profit potential: ${total_profit:.2f}")
-        
-        if args.output:
-            output_data = {
-                "timestamp": datetime.now().isoformat(),
-                "summary": {
-                    "contracts_processed": len(results),
-                    "successful_analyses": successful,
-                    "total_exploits": total_exploits,
-                    "total_profit_potential": total_profit
-                },
-                "results": [asdict(r) for r in results],
-                "performance_stats": processor.get_performance_stats()
-            }
-            
-            with open(args.output, 'w') as f:
-                json.dump(output_data, f, indent=2, default=str)
-            
-            logger.info(f"Results saved to {args.output}")
-        
+            result = await processor.process_contract(target)
+
+            if args.output:
+                output_data = {
+                    "timestamp": datetime.now().isoformat(),
+                    "results": [asdict(result)],
+                    "performance_stats": processor.get_performance_stats()
+                }
+                with open(args.output, 'w') as f:
+                    json.dump(output_data, f, indent=2, default=str)
+                logger.info(f"Results saved to {args.output}")
+
+            return 0
+
+        if not args.queue_url:
+            logger.error("No contract or queue specified. Provide --contract or --queue-url")
+            return 1
+
+        queue = ContractQueue(args.queue_url, args.queue_name)
+        await queue.connect()
+
+        logger.info("Processing contracts from queue... press Ctrl+C to stop")
+        await processor.process_queue(queue, args.max_concurrent)
         return 0
         
     except KeyboardInterrupt:
