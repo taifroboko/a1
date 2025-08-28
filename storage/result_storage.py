@@ -158,7 +158,19 @@ class ResultStorage:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
+
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS contracts (
+                contract_address TEXT NOT NULL,
+                network TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                state_hash TEXT NOT NULL,
+                result_id TEXT,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (contract_address, network)
+            )
+        """)
+
         await self.db.commit()
     
     async def _create_indexes(self):
@@ -169,7 +181,9 @@ class ResultStorage:
             "CREATE INDEX IF NOT EXISTS idx_results_timestamp ON execution_results (timestamp)",
             "CREATE INDEX IF NOT EXISTS idx_results_success ON execution_results (success)",
             "CREATE INDEX IF NOT EXISTS idx_exploits_result ON exploits (result_id)",
-            "CREATE INDEX IF NOT EXISTS idx_strategies_result ON strategies (result_id)"
+            "CREATE INDEX IF NOT EXISTS idx_strategies_result ON strategies (result_id)",
+            "CREATE INDEX IF NOT EXISTS idx_contracts_address ON contracts (contract_address)",
+            "CREATE INDEX IF NOT EXISTS idx_contracts_network ON contracts (network)"
         ]
         
         for index_sql in indexes:
@@ -272,6 +286,75 @@ class ResultStorage:
                 json.dumps(execution_result.get('execution_steps', [])),
                 execution_result.get('gas_estimate', 0)
             ))
+
+    async def get_cached_result_id(self, contract_address: str, network: str, source_hash: str, state_hash: str) -> Optional[str]:
+        """Get cached result ID for contract if hashes match."""
+        cursor = await self.db.execute(
+            "SELECT result_id FROM contracts WHERE contract_address=? AND network=? AND source_hash=? AND state_hash=?",
+            (contract_address, network, source_hash, state_hash)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def update_contract_cache(self, contract_address: str, network: str, source_hash: str, state_hash: str, result_id: str):
+        """Update contract cache with latest hashes and result reference."""
+        await self.db.execute(
+            """
+            INSERT INTO contracts (contract_address, network, source_hash, state_hash, result_id, last_updated)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(contract_address, network) DO UPDATE SET
+                source_hash=excluded.source_hash,
+                state_hash=excluded.state_hash,
+                result_id=excluded.result_id,
+                last_updated=CURRENT_TIMESTAMP
+            """,
+            (contract_address, network, source_hash, state_hash, result_id)
+        )
+        await self.db.commit()
+
+    async def load_result(self, result_id: str) -> Optional[Dict[str, Any]]:
+        """Load stored result and associated detailed data."""
+        cursor = await self.db.execute(
+            """
+            SELECT contract_address, network, success, execution_time, iterations_used,
+                   strategies_generated, exploits_found, total_profit_potential,
+                   confidence_score, error_message, detailed_results_path
+            FROM execution_results WHERE id = ?
+            """,
+            (result_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+
+        detailed_results = {}
+        if row[10]:
+            try:
+                file_path = self.data_dir / row[10]
+                if self.compression_enabled and file_path.suffix == '.gz':
+                    with gzip.open(file_path, 'rt', encoding='utf-8') as f:
+                        detailed_results = json.load(f)
+                else:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        detailed_results = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load detailed results for {result_id}: {e}")
+
+        return {
+            'contract_address': row[0],
+            'network': row[1],
+            'success': bool(row[2]),
+            'execution_time': row[3],
+            'iterations_used': row[4],
+            'strategies_generated': row[5],
+            'exploits_found': row[6],
+            'total_profit_potential': row[7],
+            'confidence_score': row[8],
+            'error_message': row[9],
+            'detailed_results': detailed_results,
+            'strategies': detailed_results.get('generated_strategies', []) if isinstance(detailed_results, dict) else [],
+            'exploits': detailed_results.get('best_exploits', []) if isinstance(detailed_results, dict) else []
+        }
     
     async def get_statistics(self) -> Dict[str, Any]:
         """Get storage statistics."""
