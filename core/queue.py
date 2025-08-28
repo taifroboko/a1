@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import warnings
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
 
@@ -37,23 +38,51 @@ class ContractQueue:
         is used which is suitable for tests or development environments.
     queue_name:
         Name of the queue inside the broker.
+    maxsize:
+        Maximum number of items allowed in the local :class:`asyncio.Queue`.
+        ``0`` indicates an unbounded queue.
     """
 
-    def __init__(self, url: Optional[str] = None, queue_name: str = "contract_targets"):
+    def __init__(
+        self,
+        url: Optional[str] = None,
+        queue_name: str = "contract_targets",
+        maxsize: int = 0,
+    ) -> None:
         self.url = url
         self.queue_name = queue_name
         self._connection = None
         self._channel = None
         self._queue = None
-        self._local_queue: asyncio.Queue[QueueItem] = asyncio.Queue()
+        self._local_queue: asyncio.Queue[QueueItem] = asyncio.Queue(maxsize=maxsize)
+        self._warned_local = False
 
     async def connect(self) -> None:
         """Establish connection to the broker if a URL was supplied."""
 
-        if self.url and aio_pika:
+        if not self.url:
+            return
+
+        if not aio_pika:
+            warnings.warn(
+                "aio_pika is not installed; falling back to local queue",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+
+        try:
             self._connection = await aio_pika.connect_robust(self.url)
             self._channel = await self._connection.channel()
-            self._queue = await self._channel.declare_queue(self.queue_name, durable=True)
+            self._queue = await self._channel.declare_queue(
+                self.queue_name, durable=True
+            )
+        except Exception as exc:  # pragma: no cover - network errors are environment specific
+            warnings.warn(
+                f"Failed to connect to broker at {self.url}: {exc}. Falling back to local queue",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     async def close(self) -> None:
         """Close any open broker connections."""
@@ -68,8 +97,17 @@ class ContractQueue:
         if self._queue and aio_pika:
             body = json.dumps(item.__dict__).encode()
             message = aio_pika.Message(body=body)
-            await self._channel.default_exchange.publish(message, routing_key=self.queue_name)
+            await self._channel.default_exchange.publish(
+                message, routing_key=self.queue_name
+            )
         else:
+            if self.url and not self._warned_local:
+                warnings.warn(
+                    "Falling back to local queue; broker connection is unavailable",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._warned_local = True
             await self._local_queue.put(item)
 
     async def dequeue(self) -> QueueItem:
@@ -81,6 +119,13 @@ class ContractQueue:
                 data = json.loads(message.body.decode())
                 return QueueItem(**data)
 
+        if self.url and not self._warned_local:
+            warnings.warn(
+                "Falling back to local queue; broker connection is unavailable",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._warned_local = True
         return await self._local_queue.get()
 
     async def consume(self) -> AsyncIterator[QueueItem]:
@@ -89,6 +134,14 @@ class ContractQueue:
         while True:
             item = await self.dequeue()
             yield item
+
+    async def __aenter__(self) -> "ContractQueue":
+        if self.url:
+            await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
 
 
 __all__ = ["QueueItem", "ContractQueue"]
