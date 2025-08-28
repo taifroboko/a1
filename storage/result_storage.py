@@ -40,6 +40,8 @@ class StoredResult:
     error_message: Optional[str]
     detailed_results: Optional[Dict[str, Any]]
     session_data: Optional[Dict[str, Any]]
+    source_hash: Optional[str] = None
+    state_hash: Optional[str] = None
 
 class ResultStorage:
     """
@@ -77,7 +79,8 @@ class ResultStorage:
         """Initialize the storage system."""
         try:
             self.db = await aiosqlite.connect(self.db_path)
-            
+            self.db.row_factory = aiosqlite.Row
+
             await self.db.execute("PRAGMA journal_mode=WAL")
             await self.db.execute("PRAGMA synchronous=NORMAL")
             await self.db.execute("PRAGMA cache_size=10000")
@@ -158,7 +161,19 @@ class ResultStorage:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
+
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS contracts (
+                address TEXT NOT NULL,
+                network TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                state_hash TEXT NOT NULL,
+                result_id TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (address, network)
+            )
+        """)
+
         await self.db.commit()
     
     async def _create_indexes(self):
@@ -169,14 +184,15 @@ class ResultStorage:
             "CREATE INDEX IF NOT EXISTS idx_results_timestamp ON execution_results (timestamp)",
             "CREATE INDEX IF NOT EXISTS idx_results_success ON execution_results (success)",
             "CREATE INDEX IF NOT EXISTS idx_exploits_result ON exploits (result_id)",
-            "CREATE INDEX IF NOT EXISTS idx_strategies_result ON strategies (result_id)"
+            "CREATE INDEX IF NOT EXISTS idx_strategies_result ON strategies (result_id)",
+            "CREATE INDEX IF NOT EXISTS idx_contracts_network ON contracts (network)"
         ]
         
         for index_sql in indexes:
             await self.db.execute(index_sql)
         
         await self.db.commit()
-    
+
     async def store_result(self, session_id: str, result) -> str:
         """
         Store execution result.
@@ -215,7 +231,16 @@ class ResultStorage:
             
             if result.detailed_results and 'best_exploits' in result.detailed_results:
                 await self._store_exploits(result_id, result.detailed_results['best_exploits'])
-            
+
+            if getattr(result, 'source_hash', None) and getattr(result, 'state_hash', None):
+                await self.upsert_contract(
+                    result.contract_address,
+                    result.network,
+                    result.source_hash,
+                    result.state_hash,
+                    result_id
+                )
+
             await self.db.commit()
             
             self.total_stored += 1
@@ -250,7 +275,7 @@ class ResultStorage:
             
         except Exception as e:
             logger.error(f"Failed to store detailed data for {result_id}: {e}")
-            return None
+        return None
     
     async def _store_exploits(self, result_id: str, exploits: List[Dict[str, Any]]):
         """Store exploit details."""
@@ -272,6 +297,86 @@ class ResultStorage:
                 json.dumps(execution_result.get('execution_steps', [])),
                 execution_result.get('gas_estimate', 0)
             ))
+
+    async def upsert_contract(self, address: str, network: str, source_hash: str, state_hash: str, result_id: str):
+        """Insert or update contract cache entry."""
+        await self.db.execute(
+            """
+            INSERT INTO contracts (address, network, source_hash, state_hash, result_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(address, network) DO UPDATE SET
+                source_hash=excluded.source_hash,
+                state_hash=excluded.state_hash,
+                result_id=excluded.result_id,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (address, network, source_hash, state_hash, result_id),
+        )
+
+    async def get_result(self, result_id: str) -> Optional[StoredResult]:
+        """Retrieve stored result by ID."""
+        cursor = await self.db.execute(
+            """SELECT * FROM execution_results WHERE id = ?""",
+            (result_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+
+        detailed = await self._load_detailed_data(row[12]) if row[12] else None
+        session = await self._load_detailed_data(row[13]) if row[13] else None
+
+        contract_cursor = await self.db.execute(
+            "SELECT source_hash, state_hash FROM contracts WHERE address = ? AND network = ?",
+            (row[1], row[2]),
+        )
+        contract_row = await contract_cursor.fetchone()
+        source_hash = contract_row[0] if contract_row else None
+        state_hash = contract_row[1] if contract_row else None
+
+        return StoredResult(
+            id=row[0],
+            contract_address=row[1],
+            network=row[2],
+            timestamp=row[3],
+            success=bool(row[4]),
+            execution_time=row[5],
+            iterations_used=row[6],
+            strategies_generated=row[7],
+            exploits_found=row[8],
+            total_profit_potential=row[9],
+            confidence_score=row[10],
+            error_message=row[11],
+            detailed_results=detailed,
+            session_data=session,
+            source_hash=source_hash,
+            state_hash=state_hash,
+        )
+
+    async def get_cached_result(self, address: str, network: str, source_hash: str, state_hash: str) -> Optional[StoredResult]:
+        """Get cached result if hashes match."""
+        cursor = await self.db.execute(
+            """SELECT result_id FROM contracts WHERE address = ? AND network = ? AND source_hash = ? AND state_hash = ?""",
+            (address, network, source_hash, state_hash),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return await self.get_result(row[0])
+
+    async def _load_detailed_data(self, relative_path: str) -> Optional[Dict[str, Any]]:
+        """Load detailed data from file."""
+        try:
+            file_path = self.data_dir / relative_path
+            if file_path.suffix == '.gz':
+                with gzip.open(file_path, 'rt', encoding='utf-8') as f:
+                    return json.load(f)
+            else:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load detailed data from {relative_path}: {e}")
+            return None
     
     async def get_statistics(self) -> Dict[str, Any]:
         """Get storage statistics."""
