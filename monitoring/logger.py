@@ -10,7 +10,7 @@ import logging.handlers
 import json
 import time
 import sys
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 from datetime import datetime
 import traceback
@@ -115,7 +115,7 @@ class SystemLogger:
         
         self.system_logger.addHandler(console_handler)
         self.system_logger.addHandler(system_handler)
-        
+
         self.performance_logger.addHandler(performance_handler)
         self.audit_logger.addHandler(audit_handler)
         self.error_logger.addHandler(error_handler)
@@ -189,6 +189,25 @@ class SystemLogger:
             exc_info=exception
         )
         self.log_counts['error'] += 1
+
+    def log_execution(self, strategy_id: str, tx_hashes: List[str], gas_used: int,
+                      profit: float, max_gas: int, min_profit: float):
+        """Log mainnet execution attempts and safety check results."""
+        self.audit_logger.info(
+            "Mainnet execution attempt",
+            extra={
+                'event_type': 'mainnet_execution',
+                'strategy_id': strategy_id,
+                'tx_hashes': tx_hashes,
+                'gas_used': gas_used,
+                'profit': profit,
+                'max_gas': max_gas,
+                'min_profit': min_profit,
+                'gas_check_passed': gas_used <= max_gas,
+                'profit_check_passed': profit >= min_profit
+            }
+        )
+        self.log_counts['info'] += 1
     
     def get_log_statistics(self) -> Dict[str, Any]:
         """Get logging statistics."""

@@ -66,6 +66,7 @@ class ResultStorage:
         self.data_dir.mkdir(exist_ok=True)
         (self.data_dir / 'sessions').mkdir(exist_ok=True)
         (self.data_dir / 'detailed_results').mkdir(exist_ok=True)
+        (self.data_dir / 'executions').mkdir(exist_ok=True)
         
         self.db: Optional[aiosqlite.Connection] = None
         
@@ -272,7 +273,21 @@ class ResultStorage:
                 json.dumps(execution_result.get('execution_steps', [])),
                 execution_result.get('gas_estimate', 0)
             ))
-    
+
+    async def store_execution(self, tx_hashes: List[str], details: Dict[str, Any]):
+        """Store broadcast execution results for auditing."""
+        try:
+            execution_dir = self.data_dir / 'executions'
+            execution_dir.mkdir(exist_ok=True)
+            file_path = execution_dir / f"{int(time.time()*1000)}.json"
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump({'tx_hashes': tx_hashes, **details}, f, indent=2, default=str)
+            self.total_stored += 1
+            logger.info(f"Stored execution audit at {file_path}")
+        except Exception as e:
+            self.storage_errors += 1
+            logger.error(f"Failed to store execution audit: {e}")
+
     async def get_statistics(self) -> Dict[str, Any]:
         """Get storage statistics."""
         try:
