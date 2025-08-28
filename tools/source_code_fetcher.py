@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from web3 import Web3
 from eth_utils import to_checksum_address, is_address
-import requests
+from utils.request_manager import RequestManager
 import logging
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,14 @@ class SourceCodeFetcher:
         }
     }
     
-    def __init__(self, web3_client: Web3, etherscan_api_key: str, bscscan_api_key: str):
+    def __init__(
+        self,
+        web3_client: Web3,
+        etherscan_api_key: str,
+        bscscan_api_key: str,
+        max_requests_per_second: int = 5,
+        max_batch_size: int = 5,
+    ):
         """
         Initialize the source code fetcher.
         
@@ -66,11 +73,12 @@ class SourceCodeFetcher:
         self.web3 = web3_client
         self.etherscan_api_key = etherscan_api_key
         self.bscscan_api_key = bscscan_api_key
-        self.session = requests.Session()
-        
         self.scanner_url = "https://api.etherscan.io/api"
         self.api_key = etherscan_api_key
         self.chain_id = None
+        self.max_requests_per_second = max_requests_per_second
+        self.max_batch_size = max_batch_size
+        self.rpc_url = getattr(self.web3.provider, 'endpoint_uri', 'web3')
     
     async def fetch_contract_source(self, address: str, block_number: Optional[int] = None) -> ContractInfo:
         """
@@ -184,7 +192,8 @@ class SourceCodeFetcher:
             Dictionary with proxy type and implementation address if detected
         """
         try:
-            bytecode = self.web3.eth.get_code(address, block_identifier=block_number or 'latest')
+            async with RequestManager(self.rpc_url, self.max_requests_per_second, self.max_batch_size) as rm:
+                bytecode = await rm.call(self.web3.eth.get_code, address, block_identifier=block_number or 'latest')
             
             if not bytecode or bytecode == b'0x':
                 return None
@@ -236,18 +245,25 @@ class SourceCodeFetcher:
             if proxy_type in self.PROXY_PATTERNS:
                 slot = self.PROXY_PATTERNS[proxy_type]['implementation_slot']
                 
-                storage_value = self.web3.eth.get_storage_at(
-                    proxy_address, 
-                    slot, 
-                    block_identifier=block_number or 'latest'
-                )
+                async with RequestManager(self.rpc_url, self.max_requests_per_second, self.max_batch_size) as rm:
+                    storage_value = await rm.call(
+                        self.web3.eth.get_storage_at,
+                        proxy_address,
+                        slot,
+                        block_identifier=block_number or 'latest'
+                    )
                 
                 if storage_value and storage_value != b'\x00' * 32:
                     implementation = '0x' + storage_value[-20:].hex()
                     return implementation
             
             elif proxy_type == 'EIP1167':
-                bytecode = self.web3.eth.get_code(proxy_address, block_identifier=block_number or 'latest')
+                async with RequestManager(self.rpc_url, self.max_requests_per_second, self.max_batch_size) as rm:
+                    bytecode = await rm.call(
+                        self.web3.eth.get_code,
+                        proxy_address,
+                        block_identifier=block_number or 'latest'
+                    )
                 bytecode_hex = bytecode.hex()
                 
                 match = re.search(r'363d3d373d3d3d363d73([a-fA-F0-9]{40})5af43d82803e903d91602b57fd5bf3', bytecode_hex)
@@ -259,17 +275,16 @@ class SourceCodeFetcher:
         except Exception as e:
             logger.warning(f"Error getting implementation address: {e}")
             return None
-    
+
     async def _make_request(self, url: str, params: Dict) -> Optional[Dict]:
         """Make HTTP request with retry logic."""
         max_retries = 3
-        
+
         for attempt in range(max_retries):
             try:
-                response = self.session.get(url, params=params, timeout=30)
-                response.raise_for_status()
-                return response.json()
-                
+                async with RequestManager(self.api_key, self.max_requests_per_second, self.max_batch_size) as rm:
+                    return await rm.get(url, params=params)
+
             except Exception as e:
                 logger.warning(f"Request attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:

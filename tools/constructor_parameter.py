@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from web3 import Web3
 from eth_abi import decode
 from eth_utils import to_checksum_address, keccak
+from utils.request_manager import RequestManager
 import logging
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,14 @@ class ConstructorParameterTool:
     providing context about contract configuration and initial state.
     """
     
-    def __init__(self, web3_client: Web3, etherscan_api_key: str, bscscan_api_key: str):
+    def __init__(
+        self,
+        web3_client: Web3,
+        etherscan_api_key: str,
+        bscscan_api_key: str,
+        max_requests_per_second: int = 5,
+        max_batch_size: int = 5,
+    ):
         """
         Initialize the constructor parameter tool.
         
@@ -62,6 +70,9 @@ class ConstructorParameterTool:
         self.scanner_url = "https://api.etherscan.io/api"
         self.api_key = etherscan_api_key
         self.chain_id = None
+        self.max_requests_per_second = max_requests_per_second
+        self.max_batch_size = max_batch_size
+        self.rpc_url = getattr(self.web3.provider, 'endpoint_uri', 'web3')
     
     async def analyze_constructor_parameters(self, contract_address: str, contract_abi: List[Dict]) -> ConstructorInfo:
         """
@@ -119,7 +130,7 @@ class ConstructorParameterTool:
                 deployment_tx.get('contractAddress', contract_address)
             )
         
-        receipt = self.web3.eth.get_transaction_receipt(deployment_tx['hash'])
+        receipt = await self._rpc_call(self.web3.eth.get_transaction_receipt, deployment_tx['hash'])
         
         return ConstructorInfo(
             contract_address=contract_address,
@@ -128,9 +139,17 @@ class ConstructorParameterTool:
             block_number=int(deployment_tx['blockNumber'], 16) if isinstance(deployment_tx['blockNumber'], str) else deployment_tx['blockNumber'],
             parameters=parameters,
             creation_code=deployment_tx.get('input', ''),
-            runtime_code=self.web3.eth.get_code(contract_address).hex(),
+            runtime_code=(await self._rpc_call(self.web3.eth.get_code, contract_address)).hex(),
             gas_used=receipt.gasUsed
         )
+
+    async def _rpc_call(self, func, *args, **kwargs):
+        async with RequestManager(
+            self.rpc_url,
+            self.max_requests_per_second,
+            self.max_batch_size
+        ) as rm:
+            return await rm.call(func, *args, **kwargs)
     
     async def _find_deployment_transaction(self, contract_address: str) -> Optional[Dict]:
         """Find the deployment transaction for a contract."""
@@ -147,26 +166,23 @@ class ConstructorParameterTool:
     
     async def _get_contract_creation_tx(self, contract_address: str) -> Optional[Dict]:
         """Get contract creation transaction from scanner API."""
-        import requests
-        
         params = {
             'module': 'contract',
             'action': 'getcontractcreation',
             'contractaddresses': contract_address,
             'apikey': self.api_key
         }
-        
+
         try:
-            response = requests.get(self.scanner_url, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
+            async with RequestManager(self.api_key, self.max_requests_per_second, self.max_batch_size) as rm:
+                data = await rm.get(self.scanner_url, params=params)
             
             if data.get('status') == '1' and data.get('result'):
                 result = data['result'][0]
                 
                 tx_hash = result.get('txHash')
                 if tx_hash:
-                    tx = self.web3.eth.get_transaction(tx_hash)
+                    tx = await self._rpc_call(self.web3.eth.get_transaction, tx_hash)
                     return dict(tx)
             
         except Exception as e:
@@ -177,14 +193,14 @@ class ConstructorParameterTool:
     async def _search_deployment_in_blocks(self, contract_address: str, max_blocks: int = 1000) -> Optional[Dict]:
         """Search for deployment transaction in recent blocks."""
         try:
-            current_block = self.web3.eth.block_number
+            current_block = await self._rpc_call(lambda: self.web3.eth.block_number)
             
             for block_num in range(current_block, max(0, current_block - max_blocks), -1):
-                block = self.web3.eth.get_block(block_num, full_transactions=True)
+                block = await self._rpc_call(self.web3.eth.get_block, block_num, full_transactions=True)
                 
                 for tx in block.transactions:
                     if tx.to is None:  # Contract creation transaction
-                        receipt = self.web3.eth.get_transaction_receipt(tx.hash)
+                        receipt = await self._rpc_call(self.web3.eth.get_transaction_receipt, tx.hash)
                         if receipt.contractAddress and receipt.contractAddress.lower() == contract_address.lower():
                             return dict(tx)
             
@@ -213,10 +229,10 @@ class ConstructorParameterTool:
             List of decoded constructor parameters
         """
         parameters = []
-        
+
         try:
-            runtime_code = self.web3.eth.get_code(contract_address).hex()
-            
+            runtime_code = (await self._rpc_call(self.web3.eth.get_code, contract_address)).hex()
+
             if not runtime_code or runtime_code == '0x':
                 logger.warning("No runtime code found for contract")
                 return parameters
