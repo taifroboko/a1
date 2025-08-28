@@ -38,7 +38,7 @@ from blockchain.forge import ForgeIntegration
 
 from utils.dex_utils import DexRouter, TokenUtils
 
-from storage.result_storage import ResultStorage
+from storage.result_storage import ResultStorage, StoredResult
 from config.configuration_manager import ConfigurationManager
 from monitoring.logger import SystemLogger
 from monitoring.metrics_collector import MetricsCollector
@@ -78,6 +78,9 @@ class ExecutionResult:
     confidence_score: float
     error_message: Optional[str] = None
     detailed_results: Dict[str, Any] = None
+    source_hash: Optional[str] = None
+    state_hash: Optional[str] = None
+    cached: bool = False
 
 class ContractProcessor:
     """
@@ -221,7 +224,7 @@ class ContractProcessor:
                 logger.error(f"Failed to initialize tool {tool_name}: {e}")
                 raise
     
-    async def process_contract(self, contract_target: ContractTarget) -> ExecutionResult:
+    async def process_contract(self, contract_target: ContractTarget, force: bool = False) -> ExecutionResult:
         """
         Process a single contract for exploit analysis.
         
@@ -242,11 +245,12 @@ class ContractProcessor:
         try:
             session = await self._create_execution_session(session_id, contract_target)
             self.active_sessions[session_id] = session
-            
-            result = await self._execute_analysis_workflow(session_id, contract_target)
-            
-            await self._store_execution_result(session_id, result)
-            
+
+            result = await self._execute_analysis_workflow(session_id, contract_target, force)
+
+            if not result.cached:
+                await self._store_execution_result(session_id, result)
+
             self._update_performance_metrics(result)
             
             execution_time = time.time() - start_time
@@ -368,16 +372,33 @@ class ContractProcessor:
         
         return context
     
-    async def _execute_analysis_workflow(self, session_id: str, contract_target: ContractTarget) -> ExecutionResult:
+    async def _execute_analysis_workflow(self, session_id: str, contract_target: ContractTarget, force: bool = False) -> ExecutionResult:
         """Execute the main A1 analysis workflow."""
         session = self.active_sessions[session_id]
-        
+
         try:
             logger.info(f"Phase 1: Initial analysis for {contract_target.address}")
             initial_analysis = await self.agent.execute_full_analysis(
-                contract_target.address, contract_target.network
+                contract_target.address, contract_target.network, force=force
             )
-            
+
+            if isinstance(initial_analysis, StoredResult):
+                return ExecutionResult(
+                    contract_address=initial_analysis.contract_address,
+                    network=initial_analysis.network,
+                    success=initial_analysis.success,
+                    execution_time=0.0,
+                    iterations_used=initial_analysis.iterations_used,
+                    strategies_generated=initial_analysis.strategies_generated,
+                    exploits_found=initial_analysis.exploits_found,
+                    total_profit_potential=initial_analysis.total_profit_potential,
+                    confidence_score=initial_analysis.confidence_score,
+                    detailed_results=initial_analysis.detailed_results or {},
+                    source_hash=initial_analysis.source_hash,
+                    state_hash=initial_analysis.state_hash,
+                    cached=True,
+                )
+
             if not initial_analysis.get("success", False):
                 return ExecutionResult(
                     contract_address=contract_target.address,
@@ -389,19 +410,19 @@ class ContractProcessor:
                     exploits_found=0,
                     total_profit_potential=0.0,
                     confidence_score=0.0,
-                    error_message="Contract analysis failed"
+                    error_message="Contract analysis failed",
                 )
-            
+
             strategies_generated = len(initial_analysis.get("strategies", []))
             exploits_found = len(initial_analysis.get("exploits", []))
             total_profit_potential = initial_analysis.get("total_profit_potential", 0.0)
             best_confidence = initial_analysis.get("confidence_score", 0.0)
             iterations_used = initial_analysis.get("iterations_used", 1)
-            
+
             logger.info(f"Phase 3: Final analysis for {contract_target.address}")
-            
+
             final_analysis = await self._perform_final_analysis(session)
-            
+
             return ExecutionResult(
                 contract_address=contract_target.address,
                 network=contract_target.network,
@@ -412,13 +433,15 @@ class ContractProcessor:
                 exploits_found=exploits_found,
                 total_profit_potential=total_profit_potential,
                 confidence_score=best_confidence,
-                detailed_results=final_analysis
+                detailed_results=final_analysis,
+                source_hash=self.agent.current_source_hash,
+                state_hash=self.agent.current_state_hash,
             )
-            
+
         except Exception as e:
             logger.error(f"Analysis workflow failed for {contract_target.address}: {e}")
             raise
-    
+
     async def _perform_final_analysis(self, session: Dict[str, Any]) -> Dict[str, Any]:
         """Perform final analysis and generate comprehensive report."""
         try:
@@ -572,7 +595,7 @@ class ContractProcessor:
         except Exception as e:
             logger.warning(f"Failed to cleanup session {session_id}: {e}")
     
-    async def process_batch(self, contract_targets: List[ContractTarget], max_concurrent: int = 3) -> List[ExecutionResult]:
+    async def process_batch(self, contract_targets: List[ContractTarget], max_concurrent: int = 3, force: bool = False) -> List[ExecutionResult]:
         """
         Process multiple contracts concurrently.
         
@@ -593,7 +616,7 @@ class ContractProcessor:
         
         async def process_with_semaphore(target):
             async with semaphore:
-                return await self.process_contract(target)
+                return await self.process_contract(target, force=force)
         
         tasks = [process_with_semaphore(target) for target in contract_targets]
         
@@ -613,7 +636,7 @@ class ContractProcessor:
         logger.info(f"Batch processing completed: {len(results)} results")
         return results
 
-    async def process_queue(self, queue: ContractQueue, max_concurrent: int = 3) -> None:
+    async def process_queue(self, queue: ContractQueue, max_concurrent: int = 3, force: bool = False) -> None:
         """Continuously process contracts from a message queue.
 
         Args:
@@ -630,7 +653,7 @@ class ContractProcessor:
         async def handle(item: QueueItem):
             async with semaphore:
                 target = ContractTarget(address=item.address, network=item.network)
-                await self.process_contract(target)
+                await self.process_contract(target, force=force)
 
         try:
             async for item in queue.consume():
@@ -740,6 +763,7 @@ async def main():
     parser.add_argument('--max-concurrent', type=int, default=3, help='Maximum concurrent executions')
     parser.add_argument('--output', '-o', help='Output file for results')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose logging')
+    parser.add_argument('--force', action='store_true', help='Force re-analysis even if cached results exist')
     
     args = parser.parse_args()
     
@@ -761,7 +785,7 @@ async def main():
                 name=f"Manual_{args.contract[:8]}"
             )
             logger.info("Processing single contract...")
-            result = await processor.process_contract(target)
+            result = await processor.process_contract(target, force=args.force)
 
             if args.output:
                 output_data = {
@@ -783,7 +807,7 @@ async def main():
         await queue.connect()
 
         logger.info("Processing contracts from queue... press Ctrl+C to stop")
-        await processor.process_queue(queue, args.max_concurrent)
+        await processor.process_queue(queue, args.max_concurrent, force=args.force)
         return 0
         
     except KeyboardInterrupt:
