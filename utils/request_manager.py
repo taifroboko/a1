@@ -13,7 +13,9 @@ class RequestManager:
     generic function calls in addition to standard HTTP requests.
     """
 
-    _workers: Dict[str, "_RequestWorker"] = {}
+    # Tracks active workers per API key along with reference counts.
+    # Each entry maps an API key to a tuple of (_RequestWorker, ref_count).
+    _workers: Dict[str, Tuple["_RequestWorker", int]] = {}
 
     def __init__(self, api_key: str,
                  max_requests_per_second: int = 5,
@@ -23,17 +25,25 @@ class RequestManager:
         self.max_requests_per_second = max_requests_per_second
         self.max_batch_size = max_batch_size
         if self.api_key not in RequestManager._workers:
-            RequestManager._workers[self.api_key] = _RequestWorker(
+            worker = _RequestWorker(
                 max_requests_per_second, max_batch_size, maxsize=queue_maxsize
             )
-        self.worker = RequestManager._workers[self.api_key]
+            RequestManager._workers[self.api_key] = (worker, 1)
+        else:
+            worker, ref_count = RequestManager._workers[self.api_key]
+            RequestManager._workers[self.api_key] = (worker, ref_count + 1)
+        self.worker = worker
 
     async def __aenter__(self) -> "RequestManager":
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self.worker.shutdown()
-        RequestManager._workers.pop(self.api_key, None)
+        worker, ref_count = RequestManager._workers.get(self.api_key, (self.worker, 0))
+        if ref_count <= 1:
+            await worker.shutdown()
+            RequestManager._workers.pop(self.api_key, None)
+        else:
+            RequestManager._workers[self.api_key] = (worker, ref_count - 1)
         return None
 
     async def get(self, url: str, **kwargs) -> Any:
