@@ -24,6 +24,10 @@ from tools.state_reader import BlockchainStateReader
 from tools.code_sanitizer import CodeSanitizer
 from tools.concrete_execution import ConcreteExecutionTool
 from tools.revenue_normalizer import RevenueNormalizer
+from blockchain.client import BlockchainClient, NetworkType
+from blockchain.forge import ForgeIntegration
+from monitoring.logger import SystemLogger
+from storage.result_storage import ResultStorage
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +105,12 @@ class A1Agent:
         )
         
         self.tools = self._initialize_tools()
+
+        # Initialize auxiliary components
+        self.system_logger = SystemLogger(config)
+        self.forge_integration = ForgeIntegration(config)
+        self.blockchain_client = BlockchainClient(config)
+        self.result_storage = ResultStorage(config)
         
         self.max_iterations = config.get('MAX_ITERATIONS', 5)
         self.base_budget_per_iteration = config.get('BASE_BUDGET_PER_ITERATION', 1000)
@@ -312,9 +322,13 @@ Provide final recommendations with confidence scores, profit projections, and ri
             Complete analysis results with generated strategies
         """
         session_id = await self.initialize_session(target_contract, chain)
-        
+
         logger.info(f"Starting full A1 analysis for {target_contract}")
-        
+
+        # Initialize integrations used during execution
+        await self.result_storage.initialize()
+        await self.forge_integration.initialize()
+
         iteration_results = []
         
         for iteration in range(1, self.max_iterations + 1):
@@ -342,7 +356,37 @@ Provide final recommendations with confidence scores, profit projections, and ri
             await asyncio.sleep(1)
         
         final_analysis = await self._generate_final_analysis(iteration_results)
-        
+        final_confidence = final_analysis['session_summary']['final_confidence']
+
+        if final_confidence >= self.confidence_threshold and self.state.strategies_generated:
+            strategy = max(self.state.strategies_generated, key=lambda s: s.confidence_score)
+            total_gas = sum(step.get('gas_estimate', 0) for step in strategy.execution_steps)
+            max_gas = self.config.get('MAX_GAS_LIMIT', 10_000_000)
+            min_profit = self.config.get('MIN_PROFIT_THRESHOLD', 0)
+            tx_hashes: List[str] = []
+
+            if total_gas <= max_gas and strategy.expected_profit_usd >= min_profit:
+                signed_txs = await self.forge_integration.craft_mainnet_tx(asdict(strategy))
+                async with self.blockchain_client as client:
+                    for raw_tx in signed_txs:
+                        tx_hashes.append(await client.send_raw_transaction(NetworkType.ETHEREUM, raw_tx))
+                final_analysis['execution'] = {'broadcasted': True, 'tx_hashes': tx_hashes}
+            else:
+                final_analysis['execution'] = {'broadcasted': False, 'reason': 'safety_check_failed'}
+
+            self.system_logger.log_execution(
+                strategy.strategy_id,
+                tx_hashes,
+                total_gas,
+                strategy.expected_profit_usd,
+                max_gas,
+                min_profit,
+            )
+            await self.result_storage.store_execution(
+                tx_hashes,
+                {'gas_used': total_gas, 'profit': strategy.expected_profit_usd}
+            )
+
         logger.info(f"Completed A1 analysis for {target_contract}")
         return final_analysis
     

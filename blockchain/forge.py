@@ -568,6 +568,52 @@ contract ExploitTest is TestBase {
         except Exception as e:
             logger.error(f"Failed to simulate transaction: {e}")
             raise
+
+    async def craft_mainnet_tx(self, strategy: Dict[str, Any]) -> List[str]:
+        """Craft signed raw transactions for mainnet execution.
+
+        Args:
+            strategy: Strategy data containing execution steps.
+
+        Returns:
+            List of signed raw transaction hex strings.
+        """
+        # Gather private keys from active forks or configuration
+        private_keys: List[str] = []
+        for cfg in self.active_forks.values():
+            private_keys.extend(cfg.private_keys)
+        if not private_keys:
+            private_keys = self.config.get('PRIVATE_KEYS', [])
+
+        if not private_keys:
+            raise ValueError("No private keys available for signing transactions")
+
+        from eth_account import Account
+        from web3 import Web3
+
+        network_cfg = self.networks.get(ForgeNetwork.ETHEREUM, {})
+        chain_id = network_cfg.get('chain_id', 1)
+        gas_price = network_cfg.get('gas_price', 0)
+
+        signed_txs: List[str] = []
+        nonce_base = strategy.get('nonce', 0)
+
+        for idx, step in enumerate(strategy.get('execution_steps', [])):
+            tx = {
+                'to': step.get('to'),
+                'value': step.get('value', 0),
+                'data': step.get('data', '0x'),
+                'gas': step.get('gas', network_cfg.get('gas_limit', 21000)),
+                'gasPrice': step.get('gas_price', gas_price),
+                'nonce': step.get('nonce', nonce_base + idx),
+                'chainId': chain_id,
+            }
+
+            account = Account.from_key(private_keys[idx % len(private_keys)])
+            signed = account.sign_transaction(tx)
+            signed_txs.append(Web3.to_hex(signed.rawTransaction))
+
+        return signed_txs
     
     async def create_snapshot(self, project_name: str, snapshot_name: str) -> str:
         """
