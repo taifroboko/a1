@@ -110,10 +110,12 @@ class ConfigurationManager:
             'CONCRETE_EXECUTION_TIMEOUT': 120,
             'SOURCE_CODE_CACHE_SIZE': 1000,
             'STATE_READER_BATCH_SIZE': 100,
-            
+
             'ENABLE_RATE_LIMITING': True,
             'MAX_REQUESTS_PER_MINUTE': 60,
             'ENABLE_REQUEST_LOGGING': True,
+            'MAX_REQUESTS_PER_SECOND': 5,
+            'MAX_BATCH_SIZE': 5,
             'SANITIZE_OUTPUTS': True,
             
             'ENABLE_CACHING': True,
@@ -158,7 +160,8 @@ class ConfigurationManager:
                    'MAX_DB_SIZE_MB', 'ETHEREUM_CHAIN_ID', 'BSC_CHAIN_ID',
                    'FORGE_TIMEOUT', 'CONCRETE_EXECUTION_TIMEOUT', 'SOURCE_CODE_CACHE_SIZE',
                    'STATE_READER_BATCH_SIZE', 'MAX_REQUESTS_PER_MINUTE', 'CACHE_TTL_SECONDS',
-                   'MAX_MEMORY_USAGE_MB', 'METRICS_COLLECTION_INTERVAL']:
+                   'MAX_MEMORY_USAGE_MB', 'METRICS_COLLECTION_INTERVAL',
+                   'MAX_REQUESTS_PER_SECOND', 'MAX_BATCH_SIZE']:
             try:
                 return int(value)
             except ValueError:
@@ -193,6 +196,12 @@ class ConfigurationManager:
         
         if self.config_data['MIN_PROFIT_PERCENTAGE'] < 0 or self.config_data['MIN_PROFIT_PERCENTAGE'] > 100:
             errors.append("MIN_PROFIT_PERCENTAGE must be between 0 and 100")
+
+        if self.config_data['MAX_REQUESTS_PER_SECOND'] < 1:
+            errors.append("MAX_REQUESTS_PER_SECOND must be at least 1")
+
+        if self.config_data['MAX_BATCH_SIZE'] < 1:
+            errors.append("MAX_BATCH_SIZE must be at least 1")
         
         url_keys = ['GROK_BASE_URL', 'ALCHEMY_ETH_URL', 'ALCHEMY_BNB_URL']
         for key in url_keys:

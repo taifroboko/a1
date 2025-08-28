@@ -17,6 +17,7 @@ from enum import Enum
 import logging
 import openai
 from openai import AsyncOpenAI
+from utils.request_manager import RequestManager
 
 from core.queue import ContractQueue, QueueItem
 
@@ -145,12 +146,16 @@ class A1Agent:
             'source_code_fetcher': SourceCodeFetcher(
                 web3_client=ethereum_client,
                 etherscan_api_key=self.config['ETHERSCAN_API_KEY'],
-                bscscan_api_key=self.config['BSCSCAN_API_KEY']
+                bscscan_api_key=self.config['BSCSCAN_API_KEY'],
+                max_requests_per_second=self.config.get('MAX_REQUESTS_PER_SECOND', 5),
+                max_batch_size=self.config.get('MAX_BATCH_SIZE', 5)
             ),
             'constructor_parameter': ConstructorParameterTool(
                 web3_client=ethereum_client,
                 etherscan_api_key=self.config['ETHERSCAN_API_KEY'],
-                bscscan_api_key=self.config['BSCSCAN_API_KEY']
+                bscscan_api_key=self.config['BSCSCAN_API_KEY'],
+                max_requests_per_second=self.config.get('MAX_REQUESTS_PER_SECOND', 5),
+                max_batch_size=self.config.get('MAX_BATCH_SIZE', 5)
             ),
             'state_reader': BlockchainStateReader(ethereum_client),
             'code_sanitizer': CodeSanitizer(),
@@ -737,22 +742,28 @@ Provide your analysis in the following JSON structure:
             Grok response with analysis results
         """
         try:
-            response = await self.grok_client.chat.completions.create(
-                model="grok-4-0709",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert smart contract security researcher and exploit developer. Provide detailed, technical analysis with actionable insights."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                max_tokens=min(budget, 4000),  # Respect budget constraints
-                temperature=0.7,
-                top_p=0.9
-            )
+            async with RequestManager(
+                self.config.get('GROK_API_KEY', 'grok'),
+                self.config.get('MAX_REQUESTS_PER_SECOND', 5),
+                self.config.get('MAX_BATCH_SIZE', 5)
+            ) as manager:
+                response = await manager.call(
+                    self.grok_client.chat.completions.create,
+                    model="grok-4-0709",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are an expert smart contract security researcher and exploit developer. Provide detailed, technical analysis with actionable insights."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    max_tokens=min(budget, 4000),  # Respect budget constraints
+                    temperature=0.7,
+                    top_p=0.9
+                )
             
             return {
                 'content': response.choices[0].message.content,
