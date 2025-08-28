@@ -12,6 +12,7 @@ import asyncio
 import json
 import time
 from typing import Dict, List, Optional, Any, Tuple
+import hashlib
 from dataclasses import dataclass, asdict
 from enum import Enum
 import logging
@@ -81,19 +82,21 @@ class AgentState:
 class A1Agent:
     """
     Main A1 Agent Controller with Grok-4-0709 integration.
-    
+
     Implements the autonomous agent that orchestrates exploit generation
     through iterative refinement with 5-iteration budget management.
     """
-    
-    def __init__(self, config: Dict[str, Any]):
+
+    def __init__(self, config: Dict[str, Any], result_storage=None):
         """
         Initialize the A1 Agent.
-        
+
         Args:
             config: Configuration dictionary with API keys and settings
+            result_storage: ResultStorage instance for caching
         """
         self.config = config
+        self.result_storage = result_storage
         
         self.grok_client = AsyncOpenAI(
             api_key=config.get('GROK_API_KEY'),
@@ -300,51 +303,95 @@ Provide final recommendations with confidence scores, profit projections, and ri
         logger.info(f"Initialized A1 session {session_id} for contract {target_contract}")
         return session_id
     
-    async def execute_full_analysis(self, target_contract: str, chain: str = 'ethereum') -> Dict[str, Any]:
-        """
-        Execute the complete 5-iteration exploit generation process.
-        
-        Args:
-            target_contract: Target contract address
-            chain: Blockchain network
-            
-        Returns:
-            Complete analysis results with generated strategies
-        """
+    async def execute_full_analysis(self, target_contract: str, chain: str = 'ethereum', force: bool = False, reuse: bool = False) -> Dict[str, Any]:
+        """Execute the complete analysis process with optional caching."""
         session_id = await self.initialize_session(target_contract, chain)
-        
+
+        source_info = await self._fetch_source_code()
+        contract_info = None
+        if 'source_code' in source_info and 'abi' in source_info:
+            class ContractInfo:
+                def __init__(self, abi, source_code, contract_name):
+                    self.abi = abi
+                    self.source_code = source_code
+                    self.contract_name = contract_name
+
+            contract_info = ContractInfo(
+                abi=source_info.get('abi', []),
+                source_code=source_info.get('source_code', ''),
+                contract_name=source_info.get('contract_name', 'Unknown')
+            )
+
+        state_snapshot = await self._capture_state_snapshot(contract_info) if contract_info else {}
+        source_hash = hashlib.sha256(source_info.get('source_code', '').encode()).hexdigest()
+        state_hash = hashlib.sha256(json.dumps(state_snapshot.get('state_data', {}), sort_keys=True).encode()).hexdigest()
+
+        if self.result_storage:
+            cached_id = await self.result_storage.get_cached_result_id(target_contract, chain, source_hash, state_hash)
+            if cached_id and not force:
+                logger.info(f"Cache hit for {target_contract} on {chain}")
+                if reuse:
+                    cached_result = await self.result_storage.load_result(cached_id)
+                    if cached_result:
+                        cached_result['cached'] = True
+                        cached_result['source_hash'] = source_hash
+                        cached_result['state_hash'] = state_hash
+                        return cached_result
+                return {
+                    'cached': True,
+                    'source_hash': source_hash,
+                    'state_hash': state_hash,
+                    'success': True,
+                    'strategies': [],
+                    'exploits': [],
+                    'total_profit_potential': 0.0,
+                    'confidence_score': 1.0,
+                    'iterations_used': 0,
+                    'detailed_results': {}
+                }
+
         logger.info(f"Starting full A1 analysis for {target_contract}")
-        
+
         iteration_results = []
-        
+
         for iteration in range(1, self.max_iterations + 1):
             logger.info(f"Executing iteration {iteration}/{self.max_iterations}")
-            
+
             iteration_budget = int(
-                self.base_budget_per_iteration * 
+                self.base_budget_per_iteration *
                 (self.diminishing_factor ** (iteration - 1))
             )
-            
+
             self.state.current_iteration = iteration
             self.state.iteration_budgets.append(iteration_budget)
-            
+
             result = await self._execute_iteration(iteration, iteration_budget)
             iteration_results.append(result)
-            
+
             self.state.total_budget_used += result.token_usage.get('total_tokens', 0)
             self.state.confidence_progression.append(result.confidence_score)
             self.state.findings_history.append(result.findings)
-            
+
             if self._should_terminate_early(iteration_results):
                 logger.info(f"Early termination at iteration {iteration}")
                 break
-            
+
             await asyncio.sleep(1)
-        
+
         final_analysis = await self._generate_final_analysis(iteration_results)
-        
+
         logger.info(f"Completed A1 analysis for {target_contract}")
-        return final_analysis
+        return {
+            'success': True,
+            'strategies': [asdict(s) for s in self.state.strategies_generated],
+            'exploits': [],
+            'total_profit_potential': sum(s.expected_profit_usd for s in self.state.strategies_generated),
+            'confidence_score': final_analysis.get('session_summary', {}).get('final_confidence', 0.0),
+            'iterations_used': len(iteration_results),
+            'detailed_results': final_analysis,
+            'source_hash': source_hash,
+            'state_hash': state_hash
+        }
     
     async def _execute_iteration(self, iteration_number: int, budget: int) -> IterationResult:
         """

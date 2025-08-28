@@ -77,6 +77,8 @@ class ExecutionResult:
     confidence_score: float
     error_message: Optional[str] = None
     detailed_results: Dict[str, Any] = None
+    source_hash: Optional[str] = None
+    state_hash: Optional[str] = None
 
 class ContractProcessor:
     """
@@ -113,14 +115,17 @@ class ContractProcessor:
         self.result_storage: Optional[ResultStorage] = None
         self.metrics_collector: Optional[MetricsCollector] = None
         self.system_logger: Optional[SystemLogger] = None
-        
+
         self.is_initialized = False
         self.active_sessions: Dict[str, Dict[str, Any]] = {}
-        
+
         self.total_contracts_processed = 0
         self.successful_analyses = 0
         self.total_exploits_found = 0
         self.total_execution_time = 0.0
+
+        self.force_analysis = False
+        self.reuse_cache = False
     
     async def initialize(self):
         """Initialize all system components."""
@@ -153,8 +158,8 @@ class ContractProcessor:
             self.feedback_processor = FeedbackProcessor(self.config)
             self.strategy_generator = StrategyGenerator(self.config)
             self.orchestrator = ToolOrchestrator(self.tools, self.config)
-            
-            self.agent = A1Agent(self.config)
+
+            self.agent = A1Agent(self.config, self.result_storage)
             
             self.is_initialized = True
             logger.info("A1 Agentic System initialized successfully")
@@ -369,7 +374,10 @@ class ContractProcessor:
         try:
             logger.info(f"Phase 1: Initial analysis for {contract_target.address}")
             initial_analysis = await self.agent.execute_full_analysis(
-                contract_target.address, contract_target.network
+                contract_target.address,
+                contract_target.network,
+                force=self.force_analysis,
+                reuse=self.reuse_cache
             )
             
             if not initial_analysis.get("success", False):
@@ -392,21 +400,24 @@ class ContractProcessor:
             best_confidence = initial_analysis.get("confidence_score", 0.0)
             iterations_used = initial_analysis.get("iterations_used", 1)
             
-            logger.info(f"Phase 3: Final analysis for {contract_target.address}")
-            
-            final_analysis = await self._perform_final_analysis(session)
-            
+            if 'detailed_results' in initial_analysis:
+                final_analysis = initial_analysis["detailed_results"]
+            else:
+                logger.info(f"Phase 3: Final analysis for {contract_target.address}")
+                final_analysis = await self._perform_final_analysis(session)
             return ExecutionResult(
                 contract_address=contract_target.address,
                 network=contract_target.network,
                 success=exploits_found > 0,
                 execution_time=0.0,  # Will be set by caller
-                iterations_used=session["metrics"]["iterations"],
+                iterations_used=iterations_used,
                 strategies_generated=strategies_generated,
                 exploits_found=exploits_found,
                 total_profit_potential=total_profit_potential,
                 confidence_score=best_confidence,
-                detailed_results=final_analysis
+                detailed_results=final_analysis,
+                source_hash=initial_analysis.get("source_hash"),
+                state_hash=initial_analysis.get("state_hash")
             )
             
         except Exception as e:
@@ -540,7 +551,15 @@ class ContractProcessor:
     async def _store_execution_result(self, session_id: str, result: ExecutionResult):
         """Store execution result in persistent storage."""
         try:
-            await self.result_storage.store_result(session_id, result)
+            result_id = await self.result_storage.store_result(session_id, result)
+            if result.source_hash and result.state_hash:
+                await self.result_storage.update_contract_cache(
+                    result.contract_address,
+                    result.network,
+                    result.source_hash,
+                    result.state_hash,
+                    result_id
+                )
             logger.info(f"Stored execution result for session {session_id}")
         except Exception as e:
             logger.error(f"Failed to store execution result: {e}")
@@ -703,6 +722,8 @@ async def main():
     parser.add_argument('--max-concurrent', type=int, default=3, help='Maximum concurrent executions')
     parser.add_argument('--output', '-o', help='Output file for results')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose logging')
+    parser.add_argument('--force', action='store_true', help='Force re-analysis even if cache is valid')
+    parser.add_argument('--reuse', action='store_true', help='Reuse cached results when available')
     
     args = parser.parse_args()
     
@@ -713,10 +734,13 @@ async def main():
     config = config_manager.get_config()
     
     processor = ContractProcessor(config)
-    
+
     try:
         await processor.initialize()
-        
+
+        processor.force_analysis = args.force
+        processor.reuse_cache = args.reuse
+
         targets = []
         
         if args.contract:
