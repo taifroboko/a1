@@ -182,6 +182,62 @@ spec:
         command: ["python", "workers/analyzer_worker.py"]
 ```
 
+## 📡 Monitoring & Alerting
+
+The system emits runtime metrics that can be scraped by Prometheus. Start a
+metrics HTTP server in your deployment entrypoint to expose the `/metrics`
+endpoint:
+
+```python
+from prometheus_client import start_http_server
+start_http_server(8000)  # exposes metrics on http://localhost:8000/metrics
+```
+
+Key metrics:
+
+- `heartbeat_worker` – updated periodically to signal worker liveness
+- `queue_<name>_depth` – current depth of monitored queues
+- `watchdog_restarts` – count of worker restarts performed by the watchdog
+
+### Prometheus scrape configuration
+
+```yaml
+scrape_configs:
+  - job_name: a1-workers
+    static_configs:
+      - targets: ['a1-worker:8000']
+```
+
+### Example alerting rules
+
+```yaml
+groups:
+  - name: a1-alerts
+    rules:
+      - alert: WorkerStalled
+        expr: time() - heartbeat_worker > 60
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          description: "Analyzer worker has not reported heartbeat for 2m"
+
+      - alert: QueueBacklog
+        expr: queue_contract_targets_depth > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          description: "Queue depth exceeded 100 for 5 minutes"
+
+      - alert: FrequentRestarts
+        expr: increase(watchdog_restarts[10m]) > 3
+        labels:
+          severity: warning
+        annotations:
+          description: "Worker restarted more than 3 times in 10 minutes"
+```
+
 ## 🧪 Testing
 
 Run the test suite:
