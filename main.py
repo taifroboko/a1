@@ -41,6 +41,7 @@ from storage.result_storage import ResultStorage
 from config.configuration_manager import ConfigurationManager
 from monitoring.logger import SystemLogger
 from monitoring.metrics_collector import MetricsCollector
+from monitoring.metrics import start_metrics_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -711,7 +712,10 @@ async def main():
     
     config_manager = ConfigurationManager(args.config)
     config = config_manager.get_config()
-    
+
+    # Start Prometheus metrics HTTP server for health checks
+    start_metrics_server()
+
     processor = ContractProcessor(config)
     
     try:
