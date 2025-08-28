@@ -79,6 +79,7 @@ class ExecutionResult:
     detailed_results: Dict[str, Any] = None
     source_hash: Optional[str] = None
     state_hash: Optional[str] = None
+    cached_result_id: Optional[str] = None
 
 class ContractProcessor:
     """
@@ -379,6 +380,8 @@ class ContractProcessor:
                 force=self.force_analysis,
                 reuse=self.reuse_cache
             )
+            cached_result_id = initial_analysis.get("cached_result_id")
+
             
             if not initial_analysis.get("success", False):
                 return ExecutionResult(
@@ -391,7 +394,8 @@ class ContractProcessor:
                     exploits_found=0,
                     total_profit_potential=0.0,
                     confidence_score=0.0,
-                    error_message="Contract analysis failed"
+                    error_message="Contract analysis failed",
+                    cached_result_id=cached_result_id,
                 )
             
             strategies_generated = len(initial_analysis.get("strategies", []))
@@ -417,7 +421,8 @@ class ContractProcessor:
                 confidence_score=best_confidence,
                 detailed_results=final_analysis,
                 source_hash=initial_analysis.get("source_hash"),
-                state_hash=initial_analysis.get("state_hash")
+                state_hash=initial_analysis.get("state_hash"),
+                cached_result_id=cached_result_id,
             )
             
         except Exception as e:
@@ -550,6 +555,9 @@ class ContractProcessor:
     
     async def _store_execution_result(self, session_id: str, result: ExecutionResult):
         """Store execution result in persistent storage."""
+        if result.cached_result_id:
+            logger.info(f"Skipping storage for {session_id}; using cached result {result.cached_result_id}")
+            return
         try:
             result_id = await self.result_storage.store_result(session_id, result)
             if result.source_hash and result.state_hash:

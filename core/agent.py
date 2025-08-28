@@ -347,7 +347,8 @@ Provide final recommendations with confidence scores, profit projections, and ri
                     'total_profit_potential': 0.0,
                     'confidence_score': 1.0,
                     'iterations_used': 0,
-                    'detailed_results': {}
+                    'detailed_results': {},
+                    'cached_result_id': cached_id
                 }
 
         logger.info(f"Starting full A1 analysis for {target_contract}")
