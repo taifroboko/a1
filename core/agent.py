@@ -29,7 +29,7 @@ from tools.code_sanitizer import CodeSanitizer
 from tools.concrete_execution import ConcreteExecutionTool
 from tools.revenue_normalizer import RevenueNormalizer
 from blockchain.client import NetworkType, BlockchainClient
-from blockchain.forge import ForgeIntegration
+from blockchain.forge import ForgeIntegration, ForgeNetwork
 from storage.result_storage import ResultStorage, StoredResult
 
 logger = logging.getLogger(__name__)
@@ -435,14 +435,30 @@ Provide final recommendations with confidence scores, profit projections, and ri
                         key=lambda s: s.confidence_score
                     )
                     if best_strategy.confidence_score >= self.confidence_threshold:
-                        tx = await self.forge.craft_mainnet_tx(best_strategy)
-                        network = NetworkType.ETHEREUM if self.state.network == 'ethereum' else NetworkType.BSC
-                        tx_hash = await self.blockchain_client.send_raw_transaction(network, tx['raw_tx'])
-                        final_analysis['execution_tx'] = tx_hash
-                        if self.result_storage and self.session_id:
-                            await self.result_storage.record_transaction_outcome(
-                                self.session_id, tx_hash, True,
-                                {'strategy_id': best_strategy.strategy_id}
+                        forge_network: Optional[ForgeNetwork]
+                        network: Optional[NetworkType]
+                        if self.state.network == 'ethereum':
+                            forge_network = ForgeNetwork.ETHEREUM
+                            network = NetworkType.ETHEREUM
+                        elif self.state.network == 'bsc':
+                            forge_network = ForgeNetwork.BSC
+                            network = NetworkType.BSC
+                        else:
+                            forge_network = None
+                            network = None
+
+                        if forge_network and network:
+                            tx = await self.forge.craft_mainnet_tx(best_strategy, forge_network)
+                            tx_hash = await self.blockchain_client.send_raw_transaction(network, tx['raw_tx'])
+                            final_analysis['execution_tx'] = tx_hash
+                            if self.result_storage and self.session_id:
+                                await self.result_storage.record_transaction_outcome(
+                                    self.session_id, tx_hash, True,
+                                    {'strategy_id': best_strategy.strategy_id}
+                                )
+                        else:
+                            logger.info(
+                                f"Skipping transaction crafting for unsupported network: {self.state.network}"
                             )
         except Exception as e:  # pragma: no cover - network operations
             logger.error(f"Failed to execute validated strategy: {e}")
